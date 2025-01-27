@@ -53,7 +53,7 @@ class ModelArgs:
     """
     max_batch_size: int = 8
     max_seq_len: int = 4096 * 4
-    dtype: Literal["bf16", "fp8"] = "bf16"
+    dtype: Literal["bf16", "fp8"] = "bf16" # vs PyTorch default of float32
     vocab_size: int = 102400
     dim: int = 2048
     inter_dim: int = 10944
@@ -115,14 +115,20 @@ class ParallelEmbedding(nn.Module):
         Raises:
             ValueError: If `world_size` is not defined.
         """
+
         if world_size > 1:
-            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
-            x = x - self.vocab_start_idx
-            x[mask] = 0
+            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx) # create boolean mask for tokens outside this GPU's vocabulary range
+            x = x - self.vocab_start_idx # convert global vocabulary indices to local embedding table indices
+            x[mask] = 0 # zero out indices for tokens not handled by this GPU
+
+        # Embedding lookup
         y = F.embedding(x, self.weight)
+
         if world_size > 1:
-            y[mask] = 0
-            dist.all_reduce(y)
+            y[mask] = 0 # zero out embeddings for tokens that are not in the current process's vocabulary
+            dist.all_reduce(y) # gather embeddings from all GPUs
+
+        # Return embeddings
         return y
 
 
@@ -288,6 +294,16 @@ class RMSNorm(nn.Module):
         Returns:
             torch.Tensor: Normalized tensor with the same shape as input.
         """
+        # def rms_norm(x, weight, eps):
+        #     # Compute root mean square directly
+        #     rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True))
+            
+        #     # Normalize using x / rms
+        #     x_normalized = x / (rms + eps)
+            
+        #     # Apply only weight parameter
+        #     return x_normalized * weight  # Only has weight (scale)
+        
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
 
@@ -361,6 +377,8 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         return ramp_func
 
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+    # Apply correction for longer sequences than the original sequence length (YaRN https://arxiv.org/pdf/2309.00071)
     if seqlen > args.original_seq_len:
         low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
@@ -763,7 +781,7 @@ class Transformer(nn.Module):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
-        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False) # precompute freqs cis for rotary embeddings
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
@@ -772,25 +790,39 @@ class Transformer(nn.Module):
 
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
-            start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0.
+            start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0. Used for KV cache and rotary embeddings.
 
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
         seqlen = tokens.size(1)
+
+        # Embedding
         h = self.embed(tokens)
+
+        # Rotary embeddings + YaRN correction for longer sequences
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+
+        # Create causal mask that can be reused by attention layers
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
+        # Forward pass through each layer
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)[:, -1]
+
+        # Layer normalization and output projection
+        h = self.norm(h)[:, -1] # pick out last token for inference
         logits = self.head(h)
+
+        # Gather logits from all GPUs
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
+
+        # Return logits
         return logits
 
 
