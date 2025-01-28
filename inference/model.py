@@ -303,7 +303,7 @@ class RMSNorm(nn.Module):
             
         #     # Apply only weight parameter
         #     return x_normalized * weight  # Only has weight (scale)
-        
+
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
 
@@ -410,13 +410,20 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 class MLA(nn.Module):
     """
-    Multi-Headed Attention Layer (MLA).
+    Multi-Headed Attention Layer (MLA). 
+
+    - "The core of MLA is the low-rank joint compression for attention keys and values to reduce Key-Value (KV) cache during inference"
+    - "For the attention queries, we also perform a low-rank compression, which can reduce the activation memory during training"
+
+    DeepSeek v3: https://arxiv.org/pdf/2412.19437v1#page=7
+    RoPE: https://arxiv.org/pdf/2104.09864
+    LoRA: https://arxiv.org/pdf/2106.09685
 
     Attributes:
         dim (int): Dimensionality of the input features.
         n_heads (int): Number of attention heads.
         n_local_heads (int): Number of local attention heads for distributed systems.
-        q_lora_rank (int): Rank for low-rank query projection.
+        q_lora_rank (int): Rank for low-rank query projection. 
         kv_lora_rank (int): Rank for low-rank key/value projection.
         qk_nope_head_dim (int): Dimensionality of non-positional query/key projections.
         qk_rope_head_dim (int): Dimensionality of rotary-positional query/key projections.
@@ -436,21 +443,27 @@ class MLA(nn.Module):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
 
-        if self.q_lora_rank == 0:
+        # Query projection
+        if self.q_lora_rank == 0: # only used in 16B config
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+
+
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+
+
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
+        # KV cache
         if attn_impl == "naive":
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
@@ -471,44 +484,72 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        bsz, seqlen, _ = x.size()
+        batch_size, seqlen, dim = x.size()
         end_pos = start_pos + seqlen
-        if self.q_lora_rank == 0:
+
+        #(--- 1. Query Generation ---)#
+        if self.q_lora_rank == 0: # only used in 16B config
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+            q = self.wq_b(self.q_norm(self.wq_a(x))) # (batch_size, seqlen, n_local_heads * qk_head_dim) where qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+
+        # Split into non-positional and positional query vectors
+        q = q.view(batch_size, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # Apply rotary embeddings to positional query vectors
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
+
+        #(--- 2. Key-Value Generation ---)#
+        kv = self.wkv_a(x) # (batch_size, seqlen, dim) @ (dim, kv_lora_rank + qk_rope_head_dim) = (batch_size, seqlen, kv_lora_rank + qk_rope_head_dim)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+         
+        # Apply rotary embeddings to positional key vectors
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-        if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
+
+        #(--- 3. Compute Attention Scores ---)#
+        if attn_impl == "naive": 
+            q = torch.cat([q_nope, q_pe], dim=-1) # (batch_size, seqlen, n_local_heads, qk_nope_head_dim + qk_rope_head_dim)
             kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            kv = kv.view(batch_size, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+
+            # Cache key and value vectors
+            self.k_cache[:batch_size, start_pos:end_pos] = k
+            self.v_cache[:batch_size, start_pos:end_pos] = v
+
+            # Compute attention scores (think seq_q x seq_k attention grid)
+            scores = torch.einsum('bshd,bthd->bsht',  # b=batch, s=seq_q, t=seq_k, h=heads, d=dim
+                                q, self.k_cache[:batch_size, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+
+            # Cache key and value vectors   
+            self.kv_cache[:batch_size, start_pos:end_pos] = self.kv_norm(kv)
+            self.pe_cache[:batch_size, start_pos:end_pos] = k_pe.squeeze(2)
+
+            # Compute attention scores (think seq_q x seq_k attention grid)
+            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:batch_size, :end_pos]) +
+                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:batch_size, :end_pos])) * self.softmax_scale
+            
+        #(--- 4. Apply Causal Mask ---)#
         if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+            scores += mask.unsqueeze(1) # set attention to -inf for tokens that should not attend to each other
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x) # get attention probabilities
+
+        #(--- 5. Compute Attention Score Weighted Values ---)#
         if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:batch_size, :end_pos])
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:batch_size, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+
+        #(--- 6. Output Projection ---)#
         x = self.wo(x.flatten(2))
+
         return x
 
 
@@ -797,32 +838,32 @@ class Transformer(nn.Module):
         """
         seqlen = tokens.size(1)
 
-        # Embedding
+        #(--- 1. Embedding ---)#
         h = self.embed(tokens)
 
-        # Rotary embeddings + YaRN correction for longer sequences
+        #(--- 2. Rotary embeddings + YaRN correction for longer sequences for tokens outside current KV cache ---)#
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
 
-        # Create causal mask that can be reused by attention layers
+        #(--- 3. Create causal mask that can be reused by attention layers ---)#
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
 
-        # Forward pass through each layer
+        #(--- 4. Forward pass through each layer ---)#
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
 
-        # Layer normalization and output projection
+        #(--- 5. Layer normalization and output projection ---)#
         h = self.norm(h)[:, -1] # pick out last token for inference
         logits = self.head(h)
 
-        # Gather logits from all GPUs
+        #(--- 6. Gather logits from all GPUs ---)#
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
 
-        # Return logits
+        #(--- 7. Return logits ---)#   
         return logits
 
 
