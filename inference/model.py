@@ -652,6 +652,8 @@ class MLP(nn.Module):
     """
     Multi-Layer Perceptron (MLP) used as a feed-forward layer.
 
+    SwiGLU: https://arxiv.org/pdf/2002.05202#page=2 (Equation 5, 6)
+
     Attributes:
         w1 (nn.Module): Linear layer for input-to-hidden transformation.
         w2 (nn.Module): Linear layer for hidden-to-output transformation.
