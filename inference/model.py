@@ -599,12 +599,12 @@ class MLA(nn.Module):
             # ) * self.softmax_scale
             scores = torch.einsum('bshd,bthd->bsht', q, self.k_cache[:batch_size, :end_pos]) * self.softmax_scale
         else: # default: low-rank key and value vectors implementation
-            # Dequantize KV reconstruction weight matrix if quantized, shape: (n_local_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
+            # Dequantize KV decoding weight matrix if quantized, shape: (n_local_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank) # (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
 
             # Project non-positional full rank Query vectors into the same rank as KV latents
-            # Note: we are multiplying by the reconstruction weight matrix of the KV latents since we are approximating QK^T
+            # Note: we are multiplying by the KV decoding weight matrix since we are approximating QK^T ≈ (Q @ wkv_b) @ (x @ wkv_a)^T
             # q_nope = einsum(q_nope, wkv_b[:, :self.qk_nope_head_dim], 
             #                 'batch seq_q n_heads qk_nope_head_dim, n_heads qk_nope_head_dim kv_lora_rank -> batch seq_q n_heads kv_lora_rank')
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
