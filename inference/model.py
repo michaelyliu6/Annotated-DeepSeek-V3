@@ -50,6 +50,31 @@ class ModelArgs:
         beta_fast (int): Fast beta correction factor.
         beta_slow (int): Slow beta correction factor.
         mscale (float): Scaling factor for extended attention.
+
+    671B config:
+    {
+        "vocab_size": 129280,
+        "dim": 7168,
+        "inter_dim": 18432,
+        "moe_inter_dim": 2048,
+        "n_layers": 61,
+        "n_dense_layers": 3,
+        "n_heads": 128,
+        "n_routed_experts": 256,
+        "n_shared_experts": 1,
+        "n_activated_experts": 8,
+        "n_expert_groups": 8,
+        "n_limited_groups": 4,
+        "route_scale": 2.5,
+        "score_func": "sigmoid",
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
+        "dtype": "fp8"
+    }
+
     """
     max_batch_size: int = 8
     max_seq_len: int = 4096 * 4
@@ -207,6 +232,33 @@ class Linear(nn.Module):
         """
         return linear(x, self.weight, self.bias)
 
+'''
+(--- ColumnParallelLinear vs RowParallelLinear ---)#
+
+Regular Weight Matrix W:      Row Parallel:           Column Parallel:
+┌                  ┐         ┌                ┐      ┌         ┐ ┌         ┐
+│ w11 w12 w13 w14 │    GPU0:│ w11 w12 w13 w14│ GPU0:│ w11 w12 │ GPU1:│ w13 w14 │
+│ w21 w22 w23 w24 │    GPU1:│ w21 w22 w23 w24│      │ w21 w22 │      │ w23 w24 │
+└                  ┘         └                ┘      └         ┘ └         ┘
+
+Column Parallel:
+- Split output features across GPUs
+- forward: no communication across GPUs
+- backward: all_reduce implicitly calculated through autograd
+
+
+Row Parallel:
+- Split input features across GPUs
+- need to reduce across GPUs
+- forward: all_reduce needed
+- backward: no communication across GPUs for gradients
+
+
+
+MLP layers:
+- First layer (expanding): Column Parallel
+- Second layer (contracting): Row Parallel
+'''
 
 class ColumnParallelLinear(Linear):
     """
@@ -249,6 +301,8 @@ class RowParallelLinear(Linear):
     """
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         assert in_features % world_size == 0
+
+        # Split input features across GPUs
         self.part_in_features = in_features // world_size
         super().__init__(self.part_in_features, out_features, bias, dtype)
 
@@ -262,11 +316,17 @@ class RowParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with row-parallel computation.
         """
+        # (--- 1. Compute Local Portion  ---)#
         y = linear(x, self.weight)
+
+        # (--- 2. Combine Results Across GPUs ---)#
         if world_size > 1:
             dist.all_reduce(y)
+
+        # (--- 3. Add Bias ---)#
         if self.bias is not None:
             y += self.bias
+
         return y
 
 
@@ -443,31 +503,39 @@ class MLA(nn.Module):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
 
-        # Query projection
-        if self.q_lora_rank == 0: # only used in 16B config
+        # Query weight matrix
+        if self.q_lora_rank == 0: 
+            # full weight matrix, only used in 16B config
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
+            # low-rank weight matrices
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
 
-
+        # Key-Value Low-Rank Weight Matrices
         self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
 
-
+        # Output projection weight matrix
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+
+        # Softmax scaling factor 
         self.softmax_scale = self.qk_head_dim ** -0.5
-        if args.max_seq_len > args.original_seq_len:
+        if args.max_seq_len > args.original_seq_len: # apply correction for longer sequences than the original sequence length (YaRN https://arxiv.org/pdf/2309.00071)
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         # KV cache
-        if attn_impl == "naive":
+        if attn_impl == "naive": 
+            # Full key and value vectors
+            # Memory usage: O(batch_size × seq_len × n_heads × head_dim)
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
         else:
+            # Low-rank key and value vectors
+            # Memory usage: O(batch_size × seq_len × lora_rank)
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
@@ -488,9 +556,9 @@ class MLA(nn.Module):
         end_pos = start_pos + seqlen
 
         #(--- 1. Query Generation ---)#
-        if self.q_lora_rank == 0: # only used in 16B config
+        if self.q_lora_rank == 0: # full matrix multiplication, only used in 16B config
             q = self.wq(x)
-        else:
+        else: # default: low-rank weight matrices
             q = self.wq_b(self.q_norm(self.wq_a(x))) # (batch_size, seqlen, n_local_heads * qk_head_dim) where qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
         # Split into non-positional and positional query vectors
@@ -498,56 +566,83 @@ class MLA(nn.Module):
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         # Apply rotary embeddings to positional query vectors
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis) # (batch_size, seqlen, n_local_heads, qk_rope_head_dim)
 
         #(--- 2. Key-Value Generation ---)#
+        # Get KV latents, and positional KV embeddings
         kv = self.wkv_a(x) # (batch_size, seqlen, dim) @ (dim, kv_lora_rank + qk_rope_head_dim) = (batch_size, seqlen, kv_lora_rank + qk_rope_head_dim)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
          
-        # Apply rotary embeddings to positional key vectors
+        # Apply rotary embeddings to positional KV embeddings
+        # Note: No positional embeddings for Value vectors
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
 
         #(--- 3. Compute Attention Scores ---)#
-        if attn_impl == "naive": 
+        if attn_impl == "naive":  # full key and value vectors implementation
             q = torch.cat([q_nope, q_pe], dim=-1) # (batch_size, seqlen, n_local_heads, qk_nope_head_dim + qk_rope_head_dim)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(batch_size, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            
+             # calculate full key and value vectors from low-rank key and value vectors
+            kv = self.wkv_b(self.kv_norm(kv)) # (batch_size, seqlen, n_local_heads * (qk_nope_head_dim + v_head_dim))
+            kv = kv.view(batch_size, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim) # (batch_size, seqlen, n_local_heads, qk_nope_head_dim + v_head_dim)
 
-            # Cache key and value vectors
+            # split k and v vectors
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1) # separate k and v vectors
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # concatenate non-positional k vectors with positional k vectors
+
+            # Append full key and value vectors to cache
             self.k_cache[:batch_size, start_pos:end_pos] = k
             self.v_cache[:batch_size, start_pos:end_pos] = v
 
-            # Compute attention scores (think seq_q x seq_k attention grid)
-            scores = torch.einsum('bshd,bthd->bsht',  # b=batch, s=seq_q, t=seq_k, h=heads, d=dim
-                                q, self.k_cache[:batch_size, :end_pos]) * self.softmax_scale
-        else:
+            # Compute attention scores with scaling factor (think seq_q x seq_k attention grid)
+            # scores = einsum(q, self.k_cache[:batch_size, :end_pos],
+            #     "batch seq_q n_heads qk_head_dim, batch seq_k n_heads qk_head_dim -> batch seq_q n_heads seq_k"
+            # ) * self.softmax_scale
+            scores = torch.einsum('bshd,bthd->bsht', q, self.k_cache[:batch_size, :end_pos]) * self.softmax_scale
+        else: # default: low-rank key and value vectors implementation
+            # Dequantize KV reconstruction weight matrix if quantized, shape: (n_local_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank) # (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+
+            # Project non-positional full rank Query vectors into the same rank as KV latents
+            # Note: we are multiplying by the reconstruction weight matrix of the KV latents since we are approximating QK^T
+            # q_nope = einsum(q_nope, wkv_b[:, :self.qk_nope_head_dim], 
+            #                 'batch seq_q n_heads qk_nope_head_dim, n_heads qk_nope_head_dim kv_lora_rank -> batch seq_q n_heads kv_lora_rank')
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
 
-            # Cache key and value vectors   
+            # Append low-rank KV latents and positional embeddings to cache
             self.kv_cache[:batch_size, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:batch_size, start_pos:end_pos] = k_pe.squeeze(2)
 
-            # Compute attention scores (think seq_q x seq_k attention grid)
+            # Compute attention scores with scaling factor (think seq_q x seq_k attention grid)
+            # scores = (
+            #     einsum(q_nope, self.kv_cache[:batch_size, :end_pos],
+            #         'batch seq_q n_heads kv_lora_rank, batch seq_k kv_lora_rank -> batch seq_q n_heads seq_k')
+            #     +
+            #     einsum(q_pe, self.pe_cache[:batch_size, :end_pos],
+            #         'batch seq_q n_heads rope_dim, batch seq_k rope_dim -> batch seq_q n_heads seq_k')
+            # ) * self.softmax_scale
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:batch_size, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:batch_size, :end_pos])) * self.softmax_scale
             
         #(--- 4. Apply Causal Mask ---)#
         if mask is not None:
             scores += mask.unsqueeze(1) # set attention to -inf for tokens that should not attend to each other
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x) # get attention probabilities
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x) # get attention probabilities for seq_q x seq_k
 
         #(--- 5. Compute Attention Score Weighted Values ---)#
         if attn_impl == "naive":
+            # Compute attention score weighted values in full rank space
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:batch_size, :end_pos])
         else:
+            # Compute attention score weighted values in low-rank space and then project back to full rank space
+            # x = torch.einsum(scores, self.kv_cache[:batch_size, :end_pos], 
+            #                  'batch seq_q n_heads seq_k, batch seq_k kv_lora_rank -> batch seq_q n_heads kv_lora_rank')
+            # x = torch.einsum(x, wkv_b[:, -self.v_head_dim:], 
+            #                  'batch seq_q n_heads kv_lora_rank, n_heads v_head_dim kv_lora_rank -> batch seq_q n_heads v_head_dim')
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:batch_size, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
 
-        #(--- 6. Output Projection ---)#
+        #(--- 6. Output Projection Back to Residual Stream Dimension ---)#
         x = self.wo(x.flatten(2))
 
         return x
@@ -769,7 +864,7 @@ class Block(nn.Module):
         """
         super().__init__()
         self.attn = MLA(args)
-        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args) # first n_dense_layers are dense layers, the rest are MoE layers
         self.attn_norm = RMSNorm(args.dim)
         self.ffn_norm = RMSNorm(args.dim)
 
