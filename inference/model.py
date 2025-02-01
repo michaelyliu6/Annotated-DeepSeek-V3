@@ -67,8 +67,8 @@ class ModelArgs:
         "n_limited_groups": 4,
         "route_scale": 2.5,
         "score_func": "sigmoid",
-        "q_lora_rank": 1536,
-        "kv_lora_rank": 512,
+        "q_lora_rank": 1536, # (dim, q_lora_rank) instead of (dim, num_heads * (qk_nope_head_dim + qk_rope_head_dim))
+        "kv_lora_rank": 512, # (dim, kv_lora_rank) instead of (dim, num_heads * (qk_nope_head_dim + qk_rope_head_dim))
         "qk_nope_head_dim": 128,
         "qk_rope_head_dim": 64,
         "v_head_dim": 128,
@@ -76,6 +76,7 @@ class ModelArgs:
     }
 
     """
+    # 16B config:
     max_batch_size: int = 8
     max_seq_len: int = 4096 * 4
     dtype: Literal["bf16", "fp8"] = "bf16" # vs PyTorch default of float32
@@ -475,7 +476,7 @@ class MLA(nn.Module):
     - "The core of MLA is the low-rank joint compression for attention keys and values to reduce Key-Value (KV) cache during inference"
     - "For the attention queries, we also perform a low-rank compression, which can reduce the activation memory during training"
 
-    DeepSeek v3: https://arxiv.org/pdf/2412.19437v1#page=7
+    DeepSeek v2: https://arxiv.org/pdf/2405.04434#page=7
     RoPE: https://arxiv.org/pdf/2104.09864
     LoRA: https://arxiv.org/pdf/2106.09685
 
@@ -632,13 +633,15 @@ class MLA(nn.Module):
         #(--- 5. Compute Attention Score Weighted Values ---)#
         if attn_impl == "naive":
             # Compute attention score weighted values in full rank space
+            # x = einsum(scores, self.v_cache[:batch_size, :end_pos],
+            #            'batch seq_q n_heads seq_k, batch seq_k n_heads v_head_dim -> batch seq_q n_heads v_head_dim')
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:batch_size, :end_pos])
         else:
             # Compute attention score weighted values in low-rank space and then project back to full rank space
-            # x = torch.einsum(scores, self.kv_cache[:batch_size, :end_pos], 
-            #                  'batch seq_q n_heads seq_k, batch seq_k kv_lora_rank -> batch seq_q n_heads kv_lora_rank')
-            # x = torch.einsum(x, wkv_b[:, -self.v_head_dim:], 
-            #                  'batch seq_q n_heads kv_lora_rank, n_heads v_head_dim kv_lora_rank -> batch seq_q n_heads v_head_dim')
+            # x = einsum(scores, self.kv_cache[:batch_size, :end_pos], 
+            #            'batch seq_q n_heads seq_k, batch seq_k kv_lora_rank -> batch seq_q n_heads kv_lora_rank')
+            # x = einsum(x, wkv_b[:, -self.v_head_dim:], 
+            #            'batch seq_q n_heads kv_lora_rank, n_heads v_head_dim kv_lora_rank -> batch seq_q n_heads v_head_dim')
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:batch_size, :end_pos])
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
 
@@ -689,6 +692,8 @@ class Gate(nn.Module):
     """
     Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
 
+    For the 671B config, there are 256 experts that are divided into 8 groups of 32 experts each.
+
     Attributes:
         dim (int): Dimensionality of input features.
         topk (int): Number of top experts activated for each input.
@@ -707,14 +712,16 @@ class Gate(nn.Module):
             args (ModelArgs): Model arguments containing gating parameters.
         """
         super().__init__()
-        self.dim = args.dim
-        self.topk = args.n_activated_experts
-        self.n_groups = args.n_expert_groups
-        self.topk_groups = args.n_limited_groups
-        self.score_func = args.score_func
-        self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+        self.dim = args.dim # 7168 
+        self.topk = args.n_activated_experts # 8
+        self.n_groups = args.n_expert_groups # 8
+        self.topk_groups = args.n_limited_groups # 4
+        self.score_func = args.score_func # sigmoid
+        self.route_scale = args.route_scale # 2.5
+
+        # (--- Routing Gate ---)#
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim)) # (256, 7168)
+        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None # (256)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -726,34 +733,62 @@ class Gate(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        scores = linear(x, self.weight)
+        # (--- 1. Compute routing scores ---)#
+        # (batch_size * seq_len, n_dim) @ (n_dim, n_routed_experts) = (batch_size * seq_len, n_routed_experts)
+        scores = linear(x, self.weight) #  (batch_size * seq_len, 256 routed experts)
+
+        # Apply softmax for smaller models; and sigmoid for larger models
+        # (batch_size * seq_len, 256 total experts)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
         else:
             scores = scores.sigmoid()
         original_scores = scores
+
+        # Add optional bias term (used by larger models that use sigmoid)
         if self.bias is not None:
             scores = scores + self.bias
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+
+        #(--- 2. Mask scores not in top k groups ---)#
+        if self.n_groups > 1: # n_groups = 8
+            # Reshape into groups (batch_size * seq_len, n_groups, n_routed_experts); (batch_size * seq_len, 8 groups, 32 experts)
+            scores = scores.view(x.size(0), self.n_groups, -1) 
+
+            # For sigmoid scoring (bias=None), use max score for each group
+            # For softmax scoring (bias=!None), use top 2 scores for each group
+            # (batch_size * seq_len, n_groups); (batch_size * seq_len, 8 groups)
+            if self.bias is None: 
+                group_scores = scores.amax(dim=-1) # take max score from each group
+            else: 
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1) # sum of top 2 scores from each group 
+
+            # Select indices of top k groups (4 groups)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1] #(batch_size * seq_len, 4 groups)
+
+            # Apply mask to keep only experts from selected groups
             mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
-            scores = (scores * mask.unsqueeze(-1)).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
-        if self.score_func == "sigmoid":
+            scores = (scores * mask.unsqueeze(-1)).flatten(1) # (batch_size * seq_len, 256 routed experts)
+
+        # Gather routing weights for top k experts (8 experts)
+        indices = torch.topk(scores, self.topk, dim=-1)[1] # (batch_size * seq_len, 8 experts)
+
+        # Gather routing weights for top k experts
+        weights = original_scores.gather(1, indices) # (batch_size * seq_len, 8 experts)
+
+        # Normalize routing weights for larger models
+        if self.score_func == "sigmoid": 
             weights /= weights.sum(dim=-1, keepdim=True)
-        weights *= self.route_scale
+
+        # Scale routing weights by route_scale
+        weights *= self.route_scale # (batch_size * seq_len, 8 experts)
+
         return weights.type_as(x), indices
 
 
 class Expert(nn.Module):
     """
     Expert layer for Mixture-of-Experts (MoE) models.
+    Same as MLP layer except without model parallelism
 
     Attributes:
         w1 (nn.Module): Linear layer for input-to-hidden transformation.
@@ -789,6 +824,7 @@ class Expert(nn.Module):
 class MoE(nn.Module):
     """
     Mixture-of-Experts (MoE) module.
+    Switch Transformer: https://arxiv.org/pdf/2101.03961#page=5
 
     Attributes:
         dim (int): Dimensionality of input features.
@@ -807,14 +843,20 @@ class MoE(nn.Module):
             args (ModelArgs): Model arguments containing MoE parameters.
         """
         super().__init__()
+        # (--- Model Dimensions ---)#
         self.dim = args.dim
+
         assert args.n_routed_experts % world_size == 0
-        self.n_routed_experts = args.n_routed_experts
+        self.n_routed_experts = args.n_routed_experts # 256
         self.n_local_experts = args.n_routed_experts // world_size
-        self.n_activated_experts = args.n_activated_experts
+        self.n_activated_experts = args.n_activated_experts # 8
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+
+        # (--- Routing Gate ---)#
         self.gate = Gate(args)
+
+        # (--- Routed and Shared Experts ---)#
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
@@ -830,25 +872,47 @@ class MoE(nn.Module):
             torch.Tensor: Output tensor after expert routing and computation.
         """
         shape = x.size()
-        x = x.view(-1, self.dim)
-        weights, indices = self.gate(x)
-        y = torch.zeros_like(x)
+        x = x.view(-1, self.dim) # Flatten input tensor to (batch_size * seq_len, n_dim)
+
+        #(--- 1. Gate ---)#     
+        weights, indices = self.gate(x) # (batch_size * seq_len, 8 experts), (batch_size * seq_len, 8 experts)
+
+        #(--- 2. Apply Experts ---)#
+        y = torch.zeros_like(x) # (batch_size * seq_len, n_dim)
+
+        # Count how many tokens selected each expert (e.g., for 671B model with 256 routed experts,
+        # returns a list of 256 integers where counts[i] = number of tokens that selected expert i)
+        # (batch_size * seq_len, 256 routed experts)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
+
+        for i in range(self.experts_start_idx, self.experts_end_idx): # model parallelism
+            # Skip experts not within top k experts
+            if counts[i] == 0: 
                 continue
+
+
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
+
+            
             y[idx] += expert(x[idx]) * weights[idx, top, None]
+
+        #(--- 3. Apply Shared Experts ---)#
         z = self.shared_experts(x)
+
+        #(--- 4. Gather Results from All GPUs ---)#
         if world_size > 1:
             dist.all_reduce(y)
-        return (y + z).view(shape)
+
+        # (--- 5. Sum results from routed experts and shared experts and reshape back to residual stream dimension ---)#
+        return (y + z).view(shape) 
 
 
 class Block(nn.Module):
     """
     Transformer block combining attention and feed-forward layers.
+
+    DeepSeek v3: https://arxiv.org/pdf/2412.19437v1#page=7
 
     Attributes:
         attn (nn.Module): Attention layer (MLA).
