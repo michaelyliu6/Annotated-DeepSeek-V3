@@ -123,10 +123,14 @@ class ParallelEmbedding(nn.Module):
         self.vocab_size = vocab_size
         self.dim = dim
         assert vocab_size % world_size == 0
+
+        # (--- Local Vocabulary Range ---)#
         self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+
+        # (--- Local Embedding Table ---)#
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim)) # (129280, 7168)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -437,7 +441,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)) # (dim // 2,)
 
     # Apply correction for longer sequences than the original sequence length (YaRN https://arxiv.org/pdf/2309.00071)
     if seqlen > args.original_seq_len:
@@ -445,9 +449,9 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seqlen)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    t = torch.arange(seqlen) # (seqlen,)
+    freqs = torch.outer(t, freqs) # (seqlen, dim // 2)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs) # (seqlen, dim // 2)
     return freqs_cis
 
 
@@ -463,6 +467,8 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
+
+    
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
@@ -558,7 +564,7 @@ class MLA(nn.Module):
 
         #(--- 1. Query Generation ---)#
         if self.q_lora_rank == 0: # full matrix multiplication, only used in 16B config
-            q = self.wq(x)
+            q = self.wq(x) # (batch_size, seqlen, dim) @ (dim, n_heads * qk_head_dim) = (batch_size, seqlen, n_heads * qk_head_dim)
         else: # default: low-rank weight matrices
             q = self.wq_b(self.q_norm(self.wq_a(x))) # (batch_size, seqlen, n_local_heads * qk_head_dim) where qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -745,7 +751,7 @@ class Gate(nn.Module):
             scores = scores.sigmoid()
         original_scores = scores
 
-        # Add optional bias term (used by larger models that use sigmoid)
+        # Add bias term (used by larger models that use sigmoid)
         if self.bias is not None:
             scores = scores + self.bias
 
@@ -772,7 +778,7 @@ class Gate(nn.Module):
         # Gather routing weights for top k experts (8 experts)
         indices = torch.topk(scores, self.topk, dim=-1)[1] # (batch_size * seq_len, 8 experts)
 
-        # Gather routing weights for top k experts
+        # Gather routing weights for top k experts (8 experts)
         weights = original_scores.gather(1, indices) # (batch_size * seq_len, 8 experts)
 
         # Normalize routing weights for larger models
@@ -788,7 +794,7 @@ class Gate(nn.Module):
 class Expert(nn.Module):
     """
     Expert layer for Mixture-of-Experts (MoE) models.
-    Same as MLP layer except without model parallelism
+    Same as MLP layer except without model parallelism since each expert only lives on one GPU
 
     Attributes:
         w1 (nn.Module): Linear layer for input-to-hidden transformation.
