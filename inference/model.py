@@ -221,7 +221,7 @@ class Linear(nn.Module):
         else:
             self.register_parameter("scale", None)
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.part_out_features))
+            self.bias = nn.Parameter(torch.empty(self.out_features))
         else:
             self.register_parameter("bias", None)
 
@@ -768,14 +768,14 @@ class Gate(nn.Module):
             else: 
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1) # sum of top 2 scores from each group 
 
-            # Select indices of top k groups (4 groups)
+            # Select indices of top k GPU nodes (4 nodes)
             indices = group_scores.topk(self.topk_groups, dim=-1)[1] #(batch_size * seq_len, 4 groups)
 
-            # Apply mask to keep only experts from selected groups
+            # Apply mask to keep only experts from selected nodes
             mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
             scores = (scores * mask.unsqueeze(-1)).flatten(1) # (batch_size * seq_len, 256 routed experts)
 
-        # Gather routing weights for top k experts (8 experts)
+        # Select indices of top k experts (8 experts)
         indices = torch.topk(scores, self.topk, dim=-1)[1] # (batch_size * seq_len, 8 experts)
 
         # Gather routing weights for top k experts (8 experts)
